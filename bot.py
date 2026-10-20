@@ -4,7 +4,6 @@ import aiosqlite
 import uuid
 import aiohttp
 import os
-import re
 from datetime import datetime, timedelta
 from threading import Thread
 from http.server import SimpleHTTPRequestHandler, HTTPServer
@@ -37,6 +36,9 @@ PRICES = {
 DEVICE_PRICE = 20
 STAR_TO_RUB = 1.5
 
+# Путь к базе данных (для Render важно сохранять в /data)
+DB_PATH = os.getenv("DB_PATH", "vpn_bot.db")
+
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -48,7 +50,7 @@ user_states = {}
 # БАЗА ДАННЫХ
 # ==========================================
 async def init_db():
-    async with aiosqlite.connect("vpn_bot.db") as db:
+    async with aiosqlite.connect(DB_PATH, timeout=20) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 telegram_id INTEGER PRIMARY KEY,
@@ -56,27 +58,34 @@ async def init_db():
                 client_name TEXT,
                 expires_at INTEGER,
                 device_limit INTEGER DEFAULT 1,
-                sub_url TEXT
+                sub_url TEXT,
+                trial_used BOOLEAN DEFAULT 0
             )
         """)
         await db.commit()
 
 async def get_user(tg_id):
-    async with aiosqlite.connect("vpn_bot.db") as db:
+    async with aiosqlite.connect(DB_PATH, timeout=20) as db:
         async with db.execute("SELECT * FROM users WHERE telegram_id = ?", (tg_id,)) as cursor:
             return await cursor.fetchone()
 
 async def update_user_balance(tg_id, amount):
-    async with aiosqlite.connect("vpn_bot.db") as db:
+    async with aiosqlite.connect(DB_PATH, timeout=20) as db:
         await db.execute("UPDATE users SET balance_rub = balance_rub + ? WHERE telegram_id = ?", (amount, tg_id))
         await db.commit()
+    logging.info(f"[BALANCE LOG] User {tg_id}: {amount:+.2f} ₽")
 
 async def set_user_vpn(tg_id, client_name, expires_at, device_limit, sub_url):
-    async with aiosqlite.connect("vpn_bot.db") as db:
+    async with aiosqlite.connect(DB_PATH, timeout=20) as db:
         await db.execute(
             "UPDATE users SET client_name = ?, expires_at = ?, device_limit = ?, sub_url = ? WHERE telegram_id = ?",
             (client_name, expires_at, device_limit, sub_url, tg_id)
         )
+        await db.commit()
+
+async def set_trial_used(tg_id):
+    async with aiosqlite.connect(DB_PATH, timeout=20) as db:
+        await db.execute("UPDATE users SET trial_used = 1 WHERE telegram_id = ?", (tg_id,))
         await db.commit()
 
 # ==========================================
@@ -104,10 +113,10 @@ async def api_create_client(client_name: str, days: int, device_limit: int):
 def get_main_menu(tg_id):
     builder = InlineKeyboardBuilder()
     builder.button(text="🛒 Купить VPN", callback_data="menu_buy")
-    builder.button(text="💳 Баланс", callback_data="menu_balance")
     builder.button(text="🔑 Мой VPN", callback_data="menu_my_vpn")
+    builder.button(text="💳 Баланс", callback_data="menu_balance")
     builder.button(text="💎 Пополнить", callback_data="menu_topup")
-    builder.button(text="🎁 Промокод", callback_data="menu_promo")
+    builder.button(text="🎁 Пробный период", callback_data="menu_trial")
     builder.button(text="🆘 Помощь", url=f"https://t.me/{SUPPORT_USERNAME[1:]}")
     if tg_id == ADMIN_ID:
         builder.button(text="👑 Админ Панель", callback_data="admin_panel")
@@ -118,7 +127,7 @@ def get_main_menu(tg_id):
 async def cmd_start(message: types.Message):
     user = await get_user(message.from_user.id)
     if not user:
-        async with aiosqlite.connect("vpn_bot.db") as db:
+        async with aiosqlite.connect(DB_PATH, timeout=20) as db:
             await db.execute("INSERT INTO users (telegram_id) VALUES (?)", (message.from_user.id,))
             await db.commit()
     await message.answer(
@@ -203,6 +212,74 @@ async def process_purchase(callback: CallbackQuery):
         await callback.answer(f"Недостаточно средств! Нужно {total_cost}₽, у вас {balance:.2f}₽", show_alert=True)
 
 # ==========================================
+# ПРОБНЫЙ ПЕРИОД
+# ==========================================
+@dp.callback_query(F.data == "menu_trial")
+async def process_trial(callback: CallbackQuery):
+    user = await get_user(callback.from_user.id)
+    
+    # Проверяем, использовал ли уже пользователь пробный период
+    if user and user[6]:  # trial_used = True
+        await callback.answer("❌ Вы уже использовали пробный период.", show_alert=True)
+        return
+        
+    # Проверяем, нет ли уже активной подписки
+    if user and user[2] and user[3] > int(datetime.now().timestamp()):
+        await callback.answer("❌ У вас уже есть активная подписка.", show_alert=True)
+        return
+        
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Активировать пробный период", callback_data="trial_confirm")
+    builder.button(text="⬅️ Назад", callback_data="back_to_main")
+    await callback.message.edit_text(
+        "🎁 **Пробный период**\n\n"
+        "Мы дарим вам **24 часа** бесплатного доступа к VPN.\n"
+        "1 устройство, все доступные локации.\n\n"
+        "Нажмите кнопку ниже, чтобы активировать:",
+        reply_markup=builder.as_markup(), parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data == "trial_confirm")
+async def process_trial_confirm(callback: CallbackQuery):
+    user = await get_user(callback.from_user.id)
+    
+    if user and user[6]:
+        await callback.answer("❌ Вы уже использовали пробный период.", show_alert=True)
+        return
+    
+    unique_suffix = uuid.uuid4().hex[:6]
+    client_name = f"trial_{callback.from_user.id}_{unique_suffix}"
+    
+    # Создаем клиента на 1 день (24 часа)
+    api_data = await api_create_client(client_name, 1, 1)
+    
+    if isinstance(api_data, dict) and api_data.get("ok"):
+        client_info = api_data.get("client", {})
+        expires_at = client_info.get("expires_at")
+        sub_url = client_info.get("sub_url")
+        
+        if not expires_at:
+            expires_at = int((datetime.now() + timedelta(days=1)).timestamp())
+            
+        await set_user_vpn(callback.from_user.id, client_name, expires_at, 1, sub_url)
+        await set_trial_used(callback.from_user.id)
+        
+        dt = datetime.fromtimestamp(expires_at)
+        await callback.message.edit_text(
+            f"🎉 **Пробный период активирован!**\n\n"
+            f"Устройств: 1\n"
+            f"Действует до: {dt.strftime('%d.%m.%Y %H:%M')} (МСК)\n\n"
+            "Перейдите в раздел 'Мой VPN', чтобы получить ссылку.",
+            reply_markup=get_main_menu(callback.from_user.id), parse_mode="Markdown"
+        )
+    else:
+        print(f"[DEBUG] TRIAL ERROR: {api_data}")
+        await callback.message.edit_text(
+            f"❌ Ошибка при активации пробного периода. Попробуйте позже.",
+            reply_markup=get_main_menu(callback.from_user.id)
+        )
+
+# ==========================================
 # БАЛАНС И ПОПОЛНЕНИЕ (ЗВЕЗДЫ)
 # ==========================================
 @dp.callback_query(F.data == "menu_balance")
@@ -239,12 +316,10 @@ async def process_enter_stars(callback: CallbackQuery):
     )
     await callback.answer()
 
-# Обработка ввода текста (когда пользователь вводит число звезд)
 @dp.message(F.text.regexp(r"^\d+$"))
 async def process_stars_input(message: types.Message):
-    # Проверяем, ждем ли мы ввода от этого пользователя
     if user_states.get(message.from_user.id) != "waiting_for_stars":
-        return  # Если нет, игнорируем
+        return
         
     stars_amount = int(message.text)
     
@@ -252,12 +327,9 @@ async def process_stars_input(message: types.Message):
         await message.answer("❌ Пожалуйста, введите число от 1 до 10000.")
         return
     
-    # Сбрасываем состояние
     user_states.pop(message.from_user.id, None)
-    
     rub_amount = stars_amount * STAR_TO_RUB
     
-    # Отправляем счет на оплату
     await message.answer_invoice(
         title="Пополнение баланса Minion VPN",
         description=f"Пополнение на {rub_amount:.2f} ₽ за {stars_amount} звезд",
@@ -272,15 +344,33 @@ async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
 
 @dp.message(F.successful_payment)
 async def process_successful_payment(message: types.Message):
-    stars = message.successful_payment.total_amount
-    rub = stars * STAR_TO_RUB
-    await update_user_balance(message.from_user.id, rub)
-    await message.answer(
-        f"✅ **Баланс успешно пополнен!**\n\n"
-        f"Получено звезд: {stars}\n"
-        f"Зачислено на баланс: {rub:.2f} ₽",
-        reply_markup=get_main_menu(message.from_user.id), parse_mode="Markdown"
-    )
+    try:
+        stars = message.successful_payment.total_amount
+        rub = stars * STAR_TO_RUB
+        
+        logging.info(f"[PAYMENT] User {message.from_user.id} paid {stars} stars. Crediting {rub} RUB.")
+        
+        user = await get_user(message.from_user.id)
+        if not user:
+            async with aiosqlite.connect(DB_PATH, timeout=20) as db:
+                await db.execute("INSERT INTO users (telegram_id) VALUES (?)", (message.from_user.id,))
+                await db.commit()
+        
+        await update_user_balance(message.from_user.id, rub)
+        
+        updated_user = await get_user(message.from_user.id)
+        new_balance = updated_user[1] if updated_user else 0
+        
+        await message.answer(
+            f"✅ **Баланс успешно пополнен!**\n\n"
+            f"Получено звезд: {stars}\n"
+            f"Зачислено на баланс: {rub:.2f} ₽\n"
+            f"Текущий баланс: {new_balance:.2f} ₽",
+            reply_markup=get_main_menu(message.from_user.id), parse_mode="Markdown"
+        )
+    except Exception as e:
+        logging.error(f"[PAYMENT ERROR] {e}")
+        await message.answer("❌ Произошла ошибка при начислении баланса. Обратитесь в поддержку.")
 
 # ==========================================
 # МОЙ VPN
@@ -292,6 +382,7 @@ async def process_my_vpn(callback: CallbackQuery):
     if not user or not user[2]:
         text = "🔴 Подписка еще не активирована."
         builder.button(text="🛒 Купить VPN", callback_data="menu_buy")
+        builder.button(text="🎁 Пробный период", callback_data="menu_trial")
     else:
         client_name, expires_at, devices, sub_url = user[2], user[3], user[4], user[5]
         now = int(datetime.now().timestamp())
