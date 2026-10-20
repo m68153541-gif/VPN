@@ -4,6 +4,7 @@ import aiosqlite
 import uuid
 import aiohttp
 import os
+import re
 from datetime import datetime, timedelta
 from threading import Thread
 from http.server import SimpleHTTPRequestHandler, HTTPServer
@@ -39,6 +40,9 @@ STAR_TO_RUB = 1.5
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+# Словарь для хранения состояния (ожидаем ли мы ввод звезд от юзера)
+user_states = {}
 
 # ==========================================
 # БАЗА ДАННЫХ
@@ -199,7 +203,7 @@ async def process_purchase(callback: CallbackQuery):
         await callback.answer(f"Недостаточно средств! Нужно {total_cost}₽, у вас {balance:.2f}₽", show_alert=True)
 
 # ==========================================
-# БАЛАНС
+# БАЛАНС И ПОПОЛНЕНИЕ (ЗВЕЗДЫ)
 # ==========================================
 @dp.callback_query(F.data == "menu_balance")
 async def process_balance(callback: CallbackQuery):
@@ -213,25 +217,54 @@ async def process_balance(callback: CallbackQuery):
 @dp.callback_query(F.data == "menu_topup")
 async def process_topup(callback: CallbackQuery):
     builder = InlineKeyboardBuilder()
-    builder.button(text="💎 70 Звезд (≈105₽)", callback_data="pay_stars_70")
-    builder.button(text="💎 140 Звезд (≈210₽)", callback_data="pay_stars_140")
-    builder.button(text="💎 350 Звезд (≈525₽)", callback_data="pay_stars_350")
+    builder.button(text="⭐ Ввести количество звезд", callback_data="topup_enter_stars")
     builder.button(text="⬅️ Назад", callback_data="back_to_main")
     builder.adjust(1)
-    await callback.message.edit_text(f"Выберите пакет:\nКурс: 1 Звезда = {STAR_TO_RUB} ₽", reply_markup=builder.as_markup())
+    
+    text = (
+        f"💎 **Пополнение баланса**\n\n"
+        f"Вы можете пополнить баланс с помощью Telegram Stars (XTR).\n"
+        f"Курс: 1 Звезда = {STAR_TO_RUB} ₽\n\n"
+        f"Нажмите кнопку ниже, чтобы ввести количество звезд."
+    )
+    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
 
-@dp.callback_query(F.data.startswith("pay_stars_"))
-async def process_stars_payment(callback: CallbackQuery):
-    stars_amount = int(callback.data.split("_")[2])
+@dp.callback_query(F.data == "topup_enter_stars")
+async def process_enter_stars(callback: CallbackQuery):
+    user_states[callback.from_user.id] = "waiting_for_stars"
+    await callback.message.edit_text(
+        "Введите количество звезд, на которое хотите пополнить баланс (целое число от 1 до 10000):\n\n"
+        "Например: `50`",
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+# Обработка ввода текста (когда пользователь вводит число звезд)
+@dp.message(F.text.regexp(r"^\d+$"))
+async def process_stars_input(message: types.Message):
+    # Проверяем, ждем ли мы ввода от этого пользователя
+    if user_states.get(message.from_user.id) != "waiting_for_stars":
+        return  # Если нет, игнорируем
+        
+    stars_amount = int(message.text)
+    
+    if stars_amount < 1 or stars_amount > 10000:
+        await message.answer("❌ Пожалуйста, введите число от 1 до 10000.")
+        return
+    
+    # Сбрасываем состояние
+    user_states.pop(message.from_user.id, None)
+    
     rub_amount = stars_amount * STAR_TO_RUB
-    await callback.message.answer_invoice(
-        title="Пополнение баланса",
-        description=f"Пополнение на {rub_amount:.2f} ₽",
+    
+    # Отправляем счет на оплату
+    await message.answer_invoice(
+        title="Пополнение баланса Minion VPN",
+        description=f"Пополнение на {rub_amount:.2f} ₽ за {stars_amount} звезд",
         payload=f"topup_{stars_amount}",
         currency="XTR",
         prices=[LabeledPrice(label="XTR", amount=stars_amount)]
     )
-    await callback.answer()
 
 @dp.pre_checkout_query()
 async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
@@ -242,7 +275,12 @@ async def process_successful_payment(message: types.Message):
     stars = message.successful_payment.total_amount
     rub = stars * STAR_TO_RUB
     await update_user_balance(message.from_user.id, rub)
-    await message.answer(f"✅ Баланс пополнен на **{rub:.2f} ₽**!", reply_markup=get_main_menu(message.from_user.id), parse_mode="Markdown")
+    await message.answer(
+        f"✅ **Баланс успешно пополнен!**\n\n"
+        f"Получено звезд: {stars}\n"
+        f"Зачислено на баланс: {rub:.2f} ₽",
+        reply_markup=get_main_menu(message.from_user.id), parse_mode="Markdown"
+    )
 
 # ==========================================
 # МОЙ VPN
