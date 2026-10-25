@@ -36,14 +36,12 @@ PRICES = {
 DEVICE_PRICE = 20
 STAR_TO_RUB = 1.5
 
-# Путь к базе данных (для Render важно сохранять в /data)
 DB_PATH = os.getenv("DB_PATH", "vpn_bot.db")
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Словарь для хранения состояния (ожидаем ли мы ввод звезд от юзера)
 user_states = {}
 
 # ==========================================
@@ -217,13 +215,9 @@ async def process_purchase(callback: CallbackQuery):
 @dp.callback_query(F.data == "menu_trial")
 async def process_trial(callback: CallbackQuery):
     user = await get_user(callback.from_user.id)
-    
-    # Проверяем, использовал ли уже пользователь пробный период
-    if user and user[6]:  # trial_used = True
+    if user and user[6]:
         await callback.answer("❌ Вы уже использовали пробный период.", show_alert=True)
         return
-        
-    # Проверяем, нет ли уже активной подписки
     if user and user[2] and user[3] > int(datetime.now().timestamp()):
         await callback.answer("❌ У вас уже есть активная подписка.", show_alert=True)
         return
@@ -242,15 +236,12 @@ async def process_trial(callback: CallbackQuery):
 @dp.callback_query(F.data == "trial_confirm")
 async def process_trial_confirm(callback: CallbackQuery):
     user = await get_user(callback.from_user.id)
-    
     if user and user[6]:
         await callback.answer("❌ Вы уже использовали пробный период.", show_alert=True)
         return
     
     unique_suffix = uuid.uuid4().hex[:6]
     client_name = f"trial_{callback.from_user.id}_{unique_suffix}"
-    
-    # Создаем клиента на 1 день (24 часа)
     api_data = await api_create_client(client_name, 1, 1)
     
     if isinstance(api_data, dict) and api_data.get("ok"):
@@ -280,7 +271,7 @@ async def process_trial_confirm(callback: CallbackQuery):
         )
 
 # ==========================================
-# БАЛАНС И ПОПОЛНЕНИЕ (ЗВЕЗДЫ)
+# БАЛАНС И ПОПОЛНЕНИЕ
 # ==========================================
 @dp.callback_query(F.data == "menu_balance")
 async def process_balance(callback: CallbackQuery):
@@ -297,14 +288,13 @@ async def process_topup(callback: CallbackQuery):
     builder.button(text="⭐ Ввести количество звезд", callback_data="topup_enter_stars")
     builder.button(text="⬅️ Назад", callback_data="back_to_main")
     builder.adjust(1)
-    
-    text = (
+    await callback.message.edit_text(
         f"💎 **Пополнение баланса**\n\n"
         f"Вы можете пополнить баланс с помощью Telegram Stars (XTR).\n"
         f"Курс: 1 Звезда = {STAR_TO_RUB} ₽\n\n"
-        f"Нажмите кнопку ниже, чтобы ввести количество звезд."
+        f"Нажмите кнопку ниже, чтобы ввести количество звезд.",
+        reply_markup=builder.as_markup(), parse_mode="Markdown"
     )
-    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
 
 @dp.callback_query(F.data == "topup_enter_stars")
 async def process_enter_stars(callback: CallbackQuery):
@@ -322,7 +312,6 @@ async def process_stars_input(message: types.Message):
         return
         
     stars_amount = int(message.text)
-    
     if stars_amount < 1 or stars_amount > 10000:
         await message.answer("❌ Пожалуйста, введите число от 1 до 10000.")
         return
@@ -347,7 +336,6 @@ async def process_successful_payment(message: types.Message):
     try:
         stars = message.successful_payment.total_amount
         rub = stars * STAR_TO_RUB
-        
         logging.info(f"[PAYMENT] User {message.from_user.id} paid {stars} stars. Crediting {rub} RUB.")
         
         user = await get_user(message.from_user.id)
@@ -357,7 +345,6 @@ async def process_successful_payment(message: types.Message):
                 await db.commit()
         
         await update_user_balance(message.from_user.id, rub)
-        
         updated_user = await get_user(message.from_user.id)
         new_balance = updated_user[1] if updated_user else 0
         
@@ -410,7 +397,6 @@ async def process_show_sub_link(callback: CallbackQuery):
     if not user or not user[5]:
         await callback.answer("Ссылка не найдена. Попробуйте продлить подписку.", show_alert=True)
         return
-    
     sub_url = user[5]
     await callback.message.answer(
         f"🔗 **Ваша ссылка:**\n\n`{sub_url}`\n\nСкопируйте её и вставьте в приложение (v2rayNG, Hiddify и т.д.)",
@@ -445,13 +431,11 @@ async def process_admin_create(callback: CallbackQuery):
     days = 30 if callback.data == "admin_create_1" else 90
     unique_suffix = uuid.uuid4().hex[:8]
     client_name = f"gift_{unique_suffix}"
-    
     api_data = await api_create_client(client_name, days, 1)
     
     if isinstance(api_data, dict) and api_data.get("ok"):
         client_info = api_data.get("client", {})
         sub_url = client_info.get("sub_url")
-        
         if sub_url:
             await callback.message.answer(f"✅ Ключ на {days} дней:\n\n`{sub_url}`", parse_mode="Markdown")
         else:
@@ -481,7 +465,8 @@ async def main():
     t = Thread(target=run_dummy_server)
     t.daemon = True
     t.start()
-    await dp.start_polling(bot)
+    # ЯВНО УКАЗЫВАЕМ, ЧТО ХОТИМ ПОЛУЧАТЬ НАЖАТИЯ НА КНОПКИ
+    await dp.start_polling(bot, allowed_updates=["message", "callback_query", "pre_checkout_query"])
 
 if __name__ == "__main__":
     asyncio.run(main())
