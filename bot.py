@@ -149,8 +149,10 @@ async def process_buy(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("tariff_"))
 async def process_tariff(callback: CallbackQuery):
-    tariff_key = callback.data.split("_")[1]
+    # Отрезаем префикс "tariff_", получаем ключ (например, "1_month")
+    tariff_key = callback.data.replace("tariff_", "")
     t_data = PRICES[tariff_key]
+    
     builder = InlineKeyboardBuilder()
     for i in range(1, 6):
         total_cost = t_data['price'] + (i - 1) * DEVICE_PRICE
@@ -165,8 +167,12 @@ async def process_tariff(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("buy_"))
 async def process_purchase(callback: CallbackQuery):
-    _, tariff_key, devices = callback.data.split("_")
-    devices = int(devices)
+    # Отрезаем префикс "buy_", получаем строку вида "1_month_1"
+    raw_data = callback.data.replace("buy_", "")
+    # Разделяем по последнему подчеркиванию, чтобы отделить тариф от количества устройств
+    tariff_key, devices_str = raw_data.rsplit("_", 1)
+    devices = int(devices_str)
+    
     t_data = PRICES[tariff_key]
     total_cost = t_data['price'] + (devices - 1) * DEVICE_PRICE
     user = await get_user(callback.from_user.id)
