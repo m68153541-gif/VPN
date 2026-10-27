@@ -134,7 +134,7 @@ async def api_create_client(client_name: str, days: int, device_limit: int):
             return data
 
 # ==========================================
-# МЕНЮ
+# ГЛАВНОЕ МЕНЮ
 # ==========================================
 def get_main_menu(tg_id):
     builder = InlineKeyboardBuilder()
@@ -161,6 +161,16 @@ async def cmd_start(message: types.Message):
         "Это **Minion VPN** — новый, быстрый и качественный VPN.\n"
         "Выберите действие в меню ниже:",
         reply_markup=get_main_menu(message.from_user.id), parse_mode="Markdown"
+    )
+
+# ==========================================
+# ОБРАБОТЧИК КНОПКИ "НАЗАД"
+# ==========================================
+@dp.callback_query(F.data == "back_to_main")
+async def process_back(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "Главное меню:",
+        reply_markup=get_main_menu(callback.from_user.id)
     )
 
 # ==========================================
@@ -487,11 +497,8 @@ async def handle_get_client(request):
 # ==========================================
 async def main():
     await init_db()
-    
-    # Запускаем бота как фоновую задачу
     bot_task = asyncio.create_task(dp.start_polling(bot, allowed_updates=["message", "callback_query", "pre_checkout_query"]))
     
-    # Запускаем веб-сервер в главном потоке
     port = int(os.environ.get("PORT", 8080))
     app = web.Application()
     app.router.add_get('/api/register_app', handle_register_app)
@@ -502,7 +509,6 @@ async def main():
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     
-    # Ждем завершения бота
     await bot_task
 
 if __name__ == "__main__":
