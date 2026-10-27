@@ -5,7 +5,6 @@ import uuid
 import aiohttp
 import os
 from datetime import datetime, timedelta
-from threading import Thread
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, LabeledPrice, PreCheckoutQuery
@@ -421,7 +420,6 @@ async def process_admin_create(callback: CallbackQuery):
 async def process_admin_app_panel(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
-    # Убедимся, что таблица существует (на случай стирания базы на Render)
     async with aiosqlite.connect(DB_PATH, timeout=20) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS app_clients (
@@ -484,29 +482,28 @@ async def handle_get_client(request):
     except Exception as e:
         return web.json_response({"ok": False, "error": str(e)}, status=500)
 
-def run_web_server():
-    port = int(os.environ.get("PORT", 8080))
-    app = web.Application()
-    app.router.add_get('/api/register_app', handle_register_app)
-    app.router.add_get('/api/get_client', handle_get_client)
-    web.run_app(app, host='0.0.0.0', port=port)
-
-# ==========================================
-# ВСПОМОГАТЕЛЬНЫЕ
-# ==========================================
-@dp.callback_query(F.data == "back_to_main")
-async def process_back(callback: CallbackQuery):
-    await callback.message.edit_text("Главное меню:", reply_markup=get_main_menu(callback.from_user.id))
-
 # ==========================================
 # ЗАПУСК
 # ==========================================
 async def main():
     await init_db()
-    t = Thread(target=run_web_server)
-    t.daemon = True
-    t.start()
-    await dp.start_polling(bot, allowed_updates=["message", "callback_query", "pre_checkout_query"])
+    
+    # Запускаем бота как фоновую задачу
+    bot_task = asyncio.create_task(dp.start_polling(bot, allowed_updates=["message", "callback_query", "pre_checkout_query"]))
+    
+    # Запускаем веб-сервер в главном потоке
+    port = int(os.environ.get("PORT", 8080))
+    app = web.Application()
+    app.router.add_get('/api/register_app', handle_register_app)
+    app.router.add_get('/api/get_client', handle_get_client)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    
+    # Ждем завершения бота
+    await bot_task
 
 if __name__ == "__main__":
     asyncio.run(main())
