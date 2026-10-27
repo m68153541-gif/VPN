@@ -417,14 +417,22 @@ async def process_admin_create(callback: CallbackQuery):
     else:
         await callback.message.answer("❌ Ошибка генерации. Проверьте консоль.")
 
-# ==========================================
-# АДМИН ПАНЕЛЬ: ПРИЛОЖЕНИЕ
-# ==========================================
 @dp.callback_query(F.data == "admin_app_panel")
 async def process_admin_app_panel(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
+    # Убедимся, что таблица существует (на случай стирания базы на Render)
     async with aiosqlite.connect(DB_PATH, timeout=20) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS app_clients (
+                app_id TEXT PRIMARY KEY,
+                client_name TEXT,
+                sub_url TEXT,
+                created_at INTEGER,
+                last_connection INTEGER
+            )
+        """)
+        await db.commit()
         async with db.execute("SELECT app_id, client_name, created_at, last_connection FROM app_clients ORDER BY created_at DESC") as cursor:
             clients = await cursor.fetchall()
     
@@ -446,12 +454,10 @@ async def process_admin_app_panel(callback: CallbackQuery):
 # ==========================================
 async def handle_register_app(request):
     try:
-        # Генерируем уникальный ID (например, app_5f3a2b)
         random_suffix = uuid.uuid4().hex[:6]
         app_id = f"app_{random_suffix}"
         client_name = f"client_{app_id}"
         
-        # Создаем клиента в панели (89 дней, 1 устройство)
         api_data = await api_create_client(client_name, 89, 1)
         
         if isinstance(api_data, dict) and api_data.get("ok"):
