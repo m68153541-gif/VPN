@@ -6,12 +6,11 @@ import aiohttp
 import os
 from datetime import datetime, timedelta
 from threading import Thread
-from http.server import SimpleHTTPRequestHandler, HTTPServer
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, LabeledPrice, PreCheckoutQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiohttp import web  # Добавлено для веб-сервера
+from aiohttp import web
 
 # ==========================================
 # НАСТРОЙКИ
@@ -50,7 +49,6 @@ user_states = {}
 # ==========================================
 async def init_db():
     async with aiosqlite.connect(DB_PATH, timeout=20) as db:
-        # Таблица пользователей (для бота)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 telegram_id INTEGER PRIMARY KEY,
@@ -62,13 +60,13 @@ async def init_db():
                 trial_used BOOLEAN DEFAULT 0
             )
         """)
-        # Таблица для клиентов, созданных через приложение
         await db.execute("""
             CREATE TABLE IF NOT EXISTS app_clients (
                 app_id TEXT PRIMARY KEY,
                 client_name TEXT,
                 sub_url TEXT,
-                created_at INTEGER
+                created_at INTEGER,
+                last_connection INTEGER
             )
         """)
         await db.commit()
@@ -96,7 +94,6 @@ async def set_trial_used(tg_id):
         await db.execute("UPDATE users SET trial_used = 1 WHERE telegram_id = ?", (tg_id,))
         await db.commit()
 
-# Функции для app_clients
 async def get_app_client(app_id):
     async with aiosqlite.connect(DB_PATH, timeout=20) as db:
         async with db.execute("SELECT * FROM app_clients WHERE app_id = ?", (app_id,)) as cursor:
@@ -107,6 +104,14 @@ async def save_app_client(app_id, client_name, sub_url):
         await db.execute(
             "INSERT OR REPLACE INTO app_clients (app_id, client_name, sub_url, created_at) VALUES (?, ?, ?, ?)",
             (app_id, client_name, sub_url, int(datetime.now().timestamp()))
+        )
+        await db.commit()
+
+async def update_last_connection(app_id):
+    async with aiosqlite.connect(DB_PATH, timeout=20) as db:
+        await db.execute(
+            "UPDATE app_clients SET last_connection = ? WHERE app_id = ?",
+            (int(datetime.now().timestamp()), app_id)
         )
         await db.commit()
 
@@ -160,7 +165,7 @@ async def cmd_start(message: types.Message):
     )
 
 # ==========================================
-# ПОКУПКА (для бота)
+# ПОКУПКА
 # ==========================================
 @dp.callback_query(F.data == "menu_buy")
 async def process_buy(callback: CallbackQuery):
@@ -404,8 +409,7 @@ async def process_admin_create(callback: CallbackQuery):
     client_name = f"gift_{unique_suffix}"
     api_data = await api_create_client(client_name, days, 1)
     if isinstance(api_data, dict) and api_data.get("ok"):
-        client_info = api_data.get("client", {})
-        sub_url = client_info.get("sub_url")
+        sub_url = api_data.get("client", {}).get("sub_url")
         if sub_url:
             await callback.message.answer(f"✅ Ключ на {days} дней:\n\n`{sub_url}`", parse_mode="Markdown")
         else:
@@ -421,60 +425,64 @@ async def process_admin_app_panel(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
     async with aiosqlite.connect(DB_PATH, timeout=20) as db:
-        async with db.execute("SELECT app_id, client_name, created_at FROM app_clients ORDER BY created_at DESC") as cursor:
+        async with db.execute("SELECT app_id, client_name, created_at, last_connection FROM app_clients ORDER BY created_at DESC") as cursor:
             clients = await cursor.fetchall()
     
     if not clients:
         text = "📱 **Клиенты из приложения**\n\nПока нет ни одного подключения."
     else:
         text = "📱 **Клиенты из приложения:**\n\n"
-        for app_id, client_name, created_at in clients:
+        for app_id, client_name, created_at, last_conn in clients:
             dt = datetime.fromtimestamp(created_at)
-            text += f"• `{app_id}`\n  Клиент: {client_name}\n  Создан: {dt.strftime('%d.%m.%Y %H:%M')}\n\n"
+            last = datetime.fromtimestamp(last_conn) if last_conn else "никогда"
+            text += f"• `{app_id}`\n  Клиент: {client_name}\n  Создан: {dt.strftime('%d.%m.%Y %H:%M')}\n  Последнее подключение: {last if isinstance(last, str) else last.strftime('%d.%m.%Y %H:%M')}\n\n"
     
     builder = InlineKeyboardBuilder()
     builder.button(text="⬅️ Назад", callback_data="admin_panel")
     await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
 
 # ==========================================
-# API ДЛЯ ПРИЛОЖЕНИЯ (WEB-СЕРВЕР)
+# API ДЛЯ ПРИЛОЖЕНИЯ
 # ==========================================
-async def handle_create_client(request):
+async def handle_register_app(request):
     try:
-        app_id = request.query.get('app_id')
-        if not app_id:
-            return web.json_response({"ok": False, "error": "No app_id"}, status=400)
+        # Генерируем уникальный ID (например, app_5f3a2b)
+        random_suffix = uuid.uuid4().hex[:6]
+        app_id = f"app_{random_suffix}"
+        client_name = f"client_{app_id}"
         
-        # Проверяем, есть ли уже клиент для этого app_id
-        existing = await get_app_client(app_id)
-        if existing:
-            return web.json_response({"ok": True, "sub_url": existing[2], "client_name": existing[1]})
-        
-        # Создаем нового клиента
-        client_name = f"app_{app_id}"
+        # Создаем клиента в панели (89 дней, 1 устройство)
         api_data = await api_create_client(client_name, 89, 1)
         
         if isinstance(api_data, dict) and api_data.get("ok"):
             sub_url = api_data.get("client", {}).get("sub_url")
             await save_app_client(app_id, client_name, sub_url)
-            return web.json_response({"ok": True, "sub_url": sub_url, "client_name": client_name})
+            return web.json_response({"ok": True, "app_id": app_id})
         else:
             return web.json_response({"ok": False, "error": "API error"}, status=500)
     except Exception as e:
         return web.json_response({"ok": False, "error": str(e)}, status=500)
 
-async def handle_app_stats(request):
-    # Этот эндпоинт для админа (можно защитить паролем)
-    async with aiosqlite.connect(DB_PATH, timeout=20) as db:
-        async with db.execute("SELECT COUNT(*) FROM app_clients") as cursor:
-            count = await cursor.fetchone()
-    return web.json_response({"ok": True, "count": count[0]})
+async def handle_get_client(request):
+    try:
+        app_id = request.query.get('app_id')
+        if not app_id:
+            return web.json_response({"ok": False, "error": "No app_id"}, status=400)
+        
+        existing = await get_app_client(app_id)
+        if not existing:
+            return web.json_response({"ok": False, "error": "App ID not found"}, status=404)
+        
+        await update_last_connection(app_id)
+        return web.json_response({"ok": True, "sub_url": existing[2], "client_name": existing[1]})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
 
 def run_web_server():
     port = int(os.environ.get("PORT", 8080))
     app = web.Application()
-    app.router.add_get('/api/create_client', handle_create_client)
-    app.router.add_get('/api/app_stats', handle_app_stats)
+    app.router.add_get('/api/register_app', handle_register_app)
+    app.router.add_get('/api/get_client', handle_get_client)
     web.run_app(app, host='0.0.0.0', port=port)
 
 # ==========================================
@@ -489,11 +497,9 @@ async def process_back(callback: CallbackQuery):
 # ==========================================
 async def main():
     await init_db()
-    # Запускаем веб-сервер в отдельном потоке
     t = Thread(target=run_web_server)
     t.daemon = True
     t.start()
-    
     await dp.start_polling(bot, allowed_updates=["message", "callback_query", "pre_checkout_query"])
 
 if __name__ == "__main__":
