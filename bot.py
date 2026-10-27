@@ -11,6 +11,7 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, LabeledPrice, PreCheckoutQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiohttp import web  # Добавлено для веб-сервера
 
 # ==========================================
 # НАСТРОЙКИ
@@ -49,6 +50,7 @@ user_states = {}
 # ==========================================
 async def init_db():
     async with aiosqlite.connect(DB_PATH, timeout=20) as db:
+        # Таблица пользователей (для бота)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 telegram_id INTEGER PRIMARY KEY,
@@ -58,6 +60,15 @@ async def init_db():
                 device_limit INTEGER DEFAULT 1,
                 sub_url TEXT,
                 trial_used BOOLEAN DEFAULT 0
+            )
+        """)
+        # Таблица для клиентов, созданных через приложение
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS app_clients (
+                app_id TEXT PRIMARY KEY,
+                client_name TEXT,
+                sub_url TEXT,
+                created_at INTEGER
             )
         """)
         await db.commit()
@@ -71,7 +82,6 @@ async def update_user_balance(tg_id, amount):
     async with aiosqlite.connect(DB_PATH, timeout=20) as db:
         await db.execute("UPDATE users SET balance_rub = balance_rub + ? WHERE telegram_id = ?", (amount, tg_id))
         await db.commit()
-    logging.info(f"[BALANCE LOG] User {tg_id}: {amount:+.2f} ₽")
 
 async def set_user_vpn(tg_id, client_name, expires_at, device_limit, sub_url):
     async with aiosqlite.connect(DB_PATH, timeout=20) as db:
@@ -84,6 +94,20 @@ async def set_user_vpn(tg_id, client_name, expires_at, device_limit, sub_url):
 async def set_trial_used(tg_id):
     async with aiosqlite.connect(DB_PATH, timeout=20) as db:
         await db.execute("UPDATE users SET trial_used = 1 WHERE telegram_id = ?", (tg_id,))
+        await db.commit()
+
+# Функции для app_clients
+async def get_app_client(app_id):
+    async with aiosqlite.connect(DB_PATH, timeout=20) as db:
+        async with db.execute("SELECT * FROM app_clients WHERE app_id = ?", (app_id,)) as cursor:
+            return await cursor.fetchone()
+
+async def save_app_client(app_id, client_name, sub_url):
+    async with aiosqlite.connect(DB_PATH, timeout=20) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO app_clients (app_id, client_name, sub_url, created_at) VALUES (?, ?, ?, ?)",
+            (app_id, client_name, sub_url, int(datetime.now().timestamp()))
+        )
         await db.commit()
 
 # ==========================================
@@ -136,7 +160,7 @@ async def cmd_start(message: types.Message):
     )
 
 # ==========================================
-# ПОКУПКА
+# ПОКУПКА (для бота)
 # ==========================================
 @dp.callback_query(F.data == "menu_buy")
 async def process_buy(callback: CallbackQuery):
@@ -149,10 +173,8 @@ async def process_buy(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("tariff_"))
 async def process_tariff(callback: CallbackQuery):
-    # Отрезаем префикс "tariff_", получаем ключ (например, "1_month")
     tariff_key = callback.data.replace("tariff_", "")
     t_data = PRICES[tariff_key]
-    
     builder = InlineKeyboardBuilder()
     for i in range(1, 6):
         total_cost = t_data['price'] + (i - 1) * DEVICE_PRICE
@@ -167,12 +189,9 @@ async def process_tariff(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("buy_"))
 async def process_purchase(callback: CallbackQuery):
-    # Отрезаем префикс "buy_", получаем строку вида "1_month_1"
     raw_data = callback.data.replace("buy_", "")
-    # Разделяем по последнему подчеркиванию, чтобы отделить тариф от количества устройств
     tariff_key, devices_str = raw_data.rsplit("_", 1)
     devices = int(devices_str)
-    
     t_data = PRICES[tariff_key]
     total_cost = t_data['price'] + (devices - 1) * DEVICE_PRICE
     user = await get_user(callback.from_user.id)
@@ -180,23 +199,18 @@ async def process_purchase(callback: CallbackQuery):
     
     if balance >= total_cost:
         await update_user_balance(callback.from_user.id, -total_cost)
-        
         unique_suffix = uuid.uuid4().hex[:6]
         client_name = f"user_{callback.from_user.id}_{unique_suffix}"
-        
         api_data = await api_create_client(client_name, t_data['days'], devices)
         
         if isinstance(api_data, dict) and api_data.get("ok"):
             client_info = api_data.get("client", {})
             expires_at = client_info.get("expires_at")
             sub_url = client_info.get("sub_url")
-            
             if not expires_at:
                 expires_at = int((datetime.now() + timedelta(days=t_data['days'])).timestamp())
-            
             await set_user_vpn(callback.from_user.id, client_name, expires_at, devices, sub_url)
             dt = datetime.fromtimestamp(expires_at)
-            
             await callback.message.edit_text(
                 f"✅ **Оплата прошла успешно!**\n\n"
                 f"Списано: {total_cost}₽\n"
@@ -207,11 +221,7 @@ async def process_purchase(callback: CallbackQuery):
             )
         else:
             await update_user_balance(callback.from_user.id, total_cost)
-            print(f"[DEBUG] PURCHASE ERROR: {api_data}")
-            await callback.message.edit_text(
-                f"❌ Ошибка при создании VPN. Деньги возвращены на баланс.",
-                reply_markup=get_main_menu(callback.from_user.id)
-            )
+            await callback.message.edit_text("❌ Ошибка при создании VPN. Деньги возвращены на баланс.", reply_markup=get_main_menu(callback.from_user.id))
     else:
         await callback.answer(f"Недостаточно средств! Нужно {total_cost}₽, у вас {balance:.2f}₽", show_alert=True)
 
@@ -227,15 +237,11 @@ async def process_trial(callback: CallbackQuery):
     if user and user[2] and user[3] > int(datetime.now().timestamp()):
         await callback.answer("❌ У вас уже есть активная подписка.", show_alert=True)
         return
-        
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Активировать пробный период", callback_data="trial_confirm")
     builder.button(text="⬅️ Назад", callback_data="back_to_main")
     await callback.message.edit_text(
-        "🎁 **Пробный период**\n\n"
-        "Мы дарим вам **24 часа** бесплатного доступа к VPN.\n"
-        "1 устройство, все доступные локации.\n\n"
-        "Нажмите кнопку ниже, чтобы активировать:",
+        "🎁 **Пробный период**\n\nМы дарим вам **24 часа** бесплатного доступа.\n1 устройство.\n\nНажмите кнопку ниже:",
         reply_markup=builder.as_markup(), parse_mode="Markdown"
     )
 
@@ -245,39 +251,28 @@ async def process_trial_confirm(callback: CallbackQuery):
     if user and user[6]:
         await callback.answer("❌ Вы уже использовали пробный период.", show_alert=True)
         return
-    
     unique_suffix = uuid.uuid4().hex[:6]
     client_name = f"trial_{callback.from_user.id}_{unique_suffix}"
     api_data = await api_create_client(client_name, 1, 1)
-    
     if isinstance(api_data, dict) and api_data.get("ok"):
         client_info = api_data.get("client", {})
         expires_at = client_info.get("expires_at")
         sub_url = client_info.get("sub_url")
-        
         if not expires_at:
             expires_at = int((datetime.now() + timedelta(days=1)).timestamp())
-            
         await set_user_vpn(callback.from_user.id, client_name, expires_at, 1, sub_url)
         await set_trial_used(callback.from_user.id)
-        
         dt = datetime.fromtimestamp(expires_at)
         await callback.message.edit_text(
-            f"🎉 **Пробный период активирован!**\n\n"
-            f"Устройств: 1\n"
-            f"Действует до: {dt.strftime('%d.%m.%Y %H:%M')} (МСК)\n\n"
+            f"🎉 **Пробный период активирован!**\n\nУстройств: 1\nДействует до: {dt.strftime('%d.%m.%Y %H:%M')} (МСК)\n\n"
             "Перейдите в раздел 'Мой VPN', чтобы получить ссылку.",
             reply_markup=get_main_menu(callback.from_user.id), parse_mode="Markdown"
         )
     else:
-        print(f"[DEBUG] TRIAL ERROR: {api_data}")
-        await callback.message.edit_text(
-            f"❌ Ошибка при активации пробного периода. Попробуйте позже.",
-            reply_markup=get_main_menu(callback.from_user.id)
-        )
+        await callback.message.edit_text("❌ Ошибка при активации пробного периода.", reply_markup=get_main_menu(callback.from_user.id))
 
 # ==========================================
-# БАЛАНС И ПОПОЛНЕНИЕ
+# БАЛАНС
 # ==========================================
 @dp.callback_query(F.data == "menu_balance")
 async def process_balance(callback: CallbackQuery):
@@ -295,36 +290,26 @@ async def process_topup(callback: CallbackQuery):
     builder.button(text="⬅️ Назад", callback_data="back_to_main")
     builder.adjust(1)
     await callback.message.edit_text(
-        f"💎 **Пополнение баланса**\n\n"
-        f"Вы можете пополнить баланс с помощью Telegram Stars (XTR).\n"
-        f"Курс: 1 Звезда = {STAR_TO_RUB} ₽\n\n"
-        f"Нажмите кнопку ниже, чтобы ввести количество звезд.",
+        f"💎 **Пополнение баланса**\n\nКурс: 1 Звезда = {STAR_TO_RUB} ₽\n\nНажмите кнопку ниже:",
         reply_markup=builder.as_markup(), parse_mode="Markdown"
     )
 
 @dp.callback_query(F.data == "topup_enter_stars")
 async def process_enter_stars(callback: CallbackQuery):
     user_states[callback.from_user.id] = "waiting_for_stars"
-    await callback.message.edit_text(
-        "Введите количество звезд, на которое хотите пополнить баланс (целое число от 1 до 10000):\n\n"
-        "Например: `50`",
-        parse_mode="Markdown"
-    )
+    await callback.message.edit_text("Введите количество звезд (от 1 до 10000):\n\nНапример: `50`", parse_mode="Markdown")
     await callback.answer()
 
 @dp.message(F.text.regexp(r"^\d+$"))
 async def process_stars_input(message: types.Message):
     if user_states.get(message.from_user.id) != "waiting_for_stars":
         return
-        
     stars_amount = int(message.text)
     if stars_amount < 1 or stars_amount > 10000:
-        await message.answer("❌ Пожалуйста, введите число от 1 до 10000.")
+        await message.answer("❌ Введите число от 1 до 10000.")
         return
-    
     user_states.pop(message.from_user.id, None)
     rub_amount = stars_amount * STAR_TO_RUB
-    
     await message.answer_invoice(
         title="Пополнение баланса Minion VPN",
         description=f"Пополнение на {rub_amount:.2f} ₽ за {stars_amount} звезд",
@@ -339,31 +324,15 @@ async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
 
 @dp.message(F.successful_payment)
 async def process_successful_payment(message: types.Message):
-    try:
-        stars = message.successful_payment.total_amount
-        rub = stars * STAR_TO_RUB
-        logging.info(f"[PAYMENT] User {message.from_user.id} paid {stars} stars. Crediting {rub} RUB.")
-        
-        user = await get_user(message.from_user.id)
-        if not user:
-            async with aiosqlite.connect(DB_PATH, timeout=20) as db:
-                await db.execute("INSERT INTO users (telegram_id) VALUES (?)", (message.from_user.id,))
-                await db.commit()
-        
-        await update_user_balance(message.from_user.id, rub)
-        updated_user = await get_user(message.from_user.id)
-        new_balance = updated_user[1] if updated_user else 0
-        
-        await message.answer(
-            f"✅ **Баланс успешно пополнен!**\n\n"
-            f"Получено звезд: {stars}\n"
-            f"Зачислено на баланс: {rub:.2f} ₽\n"
-            f"Текущий баланс: {new_balance:.2f} ₽",
-            reply_markup=get_main_menu(message.from_user.id), parse_mode="Markdown"
-        )
-    except Exception as e:
-        logging.error(f"[PAYMENT ERROR] {e}")
-        await message.answer("❌ Произошла ошибка при начислении баланса. Обратитесь в поддержку.")
+    stars = message.successful_payment.total_amount
+    rub = stars * STAR_TO_RUB
+    await update_user_balance(message.from_user.id, rub)
+    user = await get_user(message.from_user.id)
+    new_balance = user[1] if user else 0
+    await message.answer(
+        f"✅ **Баланс пополнен!**\n\nПолучено звезд: {stars}\nЗачислено: {rub:.2f} ₽\nТекущий баланс: {new_balance:.2f} ₽",
+        reply_markup=get_main_menu(message.from_user.id), parse_mode="Markdown"
+    )
 
 # ==========================================
 # МОЙ VPN
@@ -384,9 +353,7 @@ async def process_my_vpn(callback: CallbackQuery):
             diff = dt - datetime.now()
             days = diff.days
             hours = diff.seconds // 3600
-            text = (f"🟢 **Статус: Активно**\n"
-                    f"🌍 Локации: Все доступные\n"
-                    f"📅 Действует до: {dt.strftime('%d.%m.%Y %H:%M')} (МСК)\n"
+            text = (f"🟢 **Статус: Активно**\n🌍 Локации: Все доступные\n📅 Действует до: {dt.strftime('%d.%m.%Y %H:%M')} (МСК)\n"
                     f"⏳ Осталось: {days} д. {hours} ч.\n")
             builder.button(text="🔗 Ссылка на подписку", callback_data="show_sub_link")
             builder.button(text="➕ Продлить / Докупить", callback_data="menu_buy")
@@ -401,13 +368,9 @@ async def process_my_vpn(callback: CallbackQuery):
 async def process_show_sub_link(callback: CallbackQuery):
     user = await get_user(callback.from_user.id)
     if not user or not user[5]:
-        await callback.answer("Ссылка не найдена. Попробуйте продлить подписку.", show_alert=True)
+        await callback.answer("Ссылка не найдена.", show_alert=True)
         return
-    sub_url = user[5]
-    await callback.message.answer(
-        f"🔗 **Ваша ссылка:**\n\n`{sub_url}`\n\nСкопируйте её и вставьте в приложение (v2rayNG, Hiddify и т.д.)",
-        parse_mode="Markdown"
-    )
+    await callback.message.answer(f"🔗 **Ваша ссылка:**\n\n`{user[5]}`\n\nСкопируйте её в приложение (v2rayNG, Hiddify и т.д.)", parse_mode="Markdown")
     await callback.answer()
 
 # ==========================================
@@ -420,7 +383,9 @@ async def process_admin_panel(callback: CallbackQuery):
         return
     builder = InlineKeyboardBuilder()
     builder.button(text="🎁 Сгенерировать ключ", callback_data="admin_gen_key")
+    builder.button(text="📱 Приложение", callback_data="admin_app_panel")
     builder.button(text="⬅️ Назад", callback_data="back_to_main")
+    builder.adjust(1)
     await callback.message.edit_text("👑 **Админ-панель**\nВыберите действие:", reply_markup=builder.as_markup(), parse_mode="Markdown")
 
 @dp.callback_query(F.data == "admin_gen_key")
@@ -438,40 +403,97 @@ async def process_admin_create(callback: CallbackQuery):
     unique_suffix = uuid.uuid4().hex[:8]
     client_name = f"gift_{unique_suffix}"
     api_data = await api_create_client(client_name, days, 1)
-    
     if isinstance(api_data, dict) and api_data.get("ok"):
         client_info = api_data.get("client", {})
         sub_url = client_info.get("sub_url")
         if sub_url:
             await callback.message.answer(f"✅ Ключ на {days} дней:\n\n`{sub_url}`", parse_mode="Markdown")
         else:
-            await callback.message.answer(f"✅ Ключ создан, но API не вернуло ссылку.\nОтвет: {api_data}")
+            await callback.message.answer("✅ Ключ создан, но API не вернуло ссылку.")
     else:
-        print(f"[DEBUG] ADMIN CREATE ERROR: {api_data}")
-        await callback.message.answer(f"❌ Ошибка генерации. Проверьте консоль.")
+        await callback.message.answer("❌ Ошибка генерации. Проверьте консоль.")
 
+# ==========================================
+# АДМИН ПАНЕЛЬ: ПРИЛОЖЕНИЕ
+# ==========================================
+@dp.callback_query(F.data == "admin_app_panel")
+async def process_admin_app_panel(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    async with aiosqlite.connect(DB_PATH, timeout=20) as db:
+        async with db.execute("SELECT app_id, client_name, created_at FROM app_clients ORDER BY created_at DESC") as cursor:
+            clients = await cursor.fetchall()
+    
+    if not clients:
+        text = "📱 **Клиенты из приложения**\n\nПока нет ни одного подключения."
+    else:
+        text = "📱 **Клиенты из приложения:**\n\n"
+        for app_id, client_name, created_at in clients:
+            dt = datetime.fromtimestamp(created_at)
+            text += f"• `{app_id}`\n  Клиент: {client_name}\n  Создан: {dt.strftime('%d.%m.%Y %H:%M')}\n\n"
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⬅️ Назад", callback_data="admin_panel")
+    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+
+# ==========================================
+# API ДЛЯ ПРИЛОЖЕНИЯ (WEB-СЕРВЕР)
+# ==========================================
+async def handle_create_client(request):
+    try:
+        app_id = request.query.get('app_id')
+        if not app_id:
+            return web.json_response({"ok": False, "error": "No app_id"}, status=400)
+        
+        # Проверяем, есть ли уже клиент для этого app_id
+        existing = await get_app_client(app_id)
+        if existing:
+            return web.json_response({"ok": True, "sub_url": existing[2], "client_name": existing[1]})
+        
+        # Создаем нового клиента
+        client_name = f"app_{app_id}"
+        api_data = await api_create_client(client_name, 89, 1)
+        
+        if isinstance(api_data, dict) and api_data.get("ok"):
+            sub_url = api_data.get("client", {}).get("sub_url")
+            await save_app_client(app_id, client_name, sub_url)
+            return web.json_response({"ok": True, "sub_url": sub_url, "client_name": client_name})
+        else:
+            return web.json_response({"ok": False, "error": "API error"}, status=500)
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+async def handle_app_stats(request):
+    # Этот эндпоинт для админа (можно защитить паролем)
+    async with aiosqlite.connect(DB_PATH, timeout=20) as db:
+        async with db.execute("SELECT COUNT(*) FROM app_clients") as cursor:
+            count = await cursor.fetchone()
+    return web.json_response({"ok": True, "count": count[0]})
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 8080))
+    app = web.Application()
+    app.router.add_get('/api/create_client', handle_create_client)
+    app.router.add_get('/api/app_stats', handle_app_stats)
+    web.run_app(app, host='0.0.0.0', port=port)
+
+# ==========================================
+# ВСПОМОГАТЕЛЬНЫЕ
+# ==========================================
 @dp.callback_query(F.data == "back_to_main")
 async def process_back(callback: CallbackQuery):
     await callback.message.edit_text("Главное меню:", reply_markup=get_main_menu(callback.from_user.id))
-
-# ==========================================
-# ЗАГЛУШКА ДЛЯ RENDER (ВЕБ-СЕРВЕР)
-# ==========================================
-def run_dummy_server():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(('0.0.0.0', port), SimpleHTTPRequestHandler)
-    logging.info(f"Запущен фейковый веб-сервер на порту {port} (для Render)")
-    server.serve_forever()
 
 # ==========================================
 # ЗАПУСК
 # ==========================================
 async def main():
     await init_db()
-    t = Thread(target=run_dummy_server)
+    # Запускаем веб-сервер в отдельном потоке
+    t = Thread(target=run_web_server)
     t.daemon = True
     t.start()
-    # ЯВНО УКАЗЫВАЕМ, ЧТО ХОТИМ ПОЛУЧАТЬ НАЖАТИЯ НА КНОПКИ
+    
     await dp.start_polling(bot, allowed_updates=["message", "callback_query", "pre_checkout_query"])
 
 if __name__ == "__main__":
